@@ -1,0 +1,683 @@
+/*
+ * Intelligent Vehicle Service Scheduling Using Priority Queues
+ * Team: Dholakpur (DSCPP-2026-III-T333)
+ *
+ * One program, three panels:
+ *   1. Customer : book a service, track status, cancel a waiting request
+ *   2. Mechanic : start next job, update work done (%), check parts in
+ *                 inventory, send a request to the owner for short parts
+ *   3. Owner    : view queue/jobs/inventory, fulfil part requests,
+ *                 restock, change priority
+ *
+ * DSA used: binary min-heap (priority queue) stored in an array.
+ * The heap stores job indices. Lower priority number is served first;
+ * equal priority is served in arrival order (smaller job ID first).
+ *
+ * Passwords (constants below): mechanic = mech123, owner = owner123
+ *
+ * Compile (C):   gcc vehicle_service.c -o vehicle_service
+ * Compile (C++): g++ -x c++ vehicle_service.c -o vehicle_service
+ * Run:           ./vehicle_service
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* ================== CONSTANTS ================== */
+#define MAX_JOBS          100
+#define MAX_PART_REQ      50
+#define NAME_LEN          20
+#define VEHICLE_LEN       15
+
+#define PRIORITY_EMERGENCY 1
+#define PRIORITY_MAJOR     2
+#define PRIORITY_REGULAR   3
+
+#define STATUS_WAITING        0
+#define STATUS_IN_PROGRESS    1
+#define STATUS_WAITING_PARTS  2
+#define STATUS_COMPLETED      3
+#define STATUS_CANCELLED      4
+
+#define REQ_PENDING    0
+#define REQ_FULFILLED  1
+
+#define NUM_PARTS      5
+#define NUM_SERVICES   5
+
+#define OWNER_PASSWORD     "owner123"
+#define MECHANIC_PASSWORD  "mech123"
+#define MAX_LOGIN_TRIES    3
+
+/* ================== DATA ================== */
+typedef struct {
+    int id;
+    char firstName[NAME_LEN];
+    char lastName[NAME_LEN];
+    char vehicleNo[VEHICLE_LEN];
+    int service;        /* 1 to NUM_SERVICES */
+    int priority;       /* 1 to 3 */
+    int status;         /* STATUS_... */
+    int progress;       /* work done, 0 to 100 */
+    int partsIssued;    /* 1 once parts are taken from inventory */
+} Job;
+
+typedef struct {
+    int jobId;
+    int part;           /* index into inventory */
+    int qty;            /* how many the owner must add */
+    int status;         /* REQ_PENDING or REQ_FULFILLED */
+} PartRequest;
+
+Job jobs[MAX_JOBS];
+int jobCount = 0;
+
+int heap[MAX_JOBS];     /* holds indices of jobs that are waiting */
+int heapSize = 0;
+
+PartRequest partReq[MAX_PART_REQ];
+int partReqCount = 0;
+
+const char *partNames[NUM_PARTS] = {
+    "Engine Oil", "Oil Filter", "Brake Pad", "Spark Plug", "Battery"
+};
+
+int inventory[NUM_PARTS] = {5, 3, 2, 8, 1};
+
+const char *serviceNames[NUM_SERVICES + 1] = {
+    "", "Oil Change", "Brake Service", "Engine Tune-up",
+    "Battery Replacement", "Full Service"
+};
+
+/* parts needed for each service (row = service, column = part) */
+int serviceParts[NUM_SERVICES + 1][NUM_PARTS] = {
+    {0, 0, 0, 0, 0},
+    {1, 1, 0, 0, 0},    /* Oil Change          */
+    {0, 0, 1, 0, 0},    /* Brake Service       */
+    {1, 0, 0, 4, 0},    /* Engine Tune-up      */
+    {0, 0, 0, 0, 1},    /* Battery Replacement */
+    {1, 1, 1, 4, 0}     /* Full Service        */
+};
+
+/* ================== HELPERS ================== */
+const char *priorityName(int p) {
+    if (p == PRIORITY_EMERGENCY) return "Emergency";
+    if (p == PRIORITY_MAJOR) return "Major";
+    return "Regular";
+}
+
+const char *statusName(int s) {
+    if (s == STATUS_WAITING) return "Waiting";
+    if (s == STATUS_IN_PROGRESS) return "In progress";
+    if (s == STATUS_WAITING_PARTS) return "Waiting for parts";
+    if (s == STATUS_COMPLETED) return "Completed";
+    return "Cancelled";
+}
+
+/* reads an integer between lo and hi, keeps asking until valid */
+int readInt(const char *msg, int lo, int hi) {
+    int v, r, c;
+    while (1) {
+        printf("%s", msg);
+        r = scanf("%d", &v);
+        if (r == EOF) exit(0);
+        if (r != 1) {
+            while ((c = getchar()) != '\n' && c != EOF);
+            printf("Please enter a number.\n");
+            continue;
+        }
+        if (v >= lo && v <= hi) return v;
+        printf("Enter a value between %d and %d.\n", lo, hi);
+    }
+}
+
+/* job ID -> index in jobs[], or -1 if it does not exist */
+int findJob(int id) {
+    if (id >= 1 && id <= jobCount) return id - 1;
+    return -1;
+}
+
+void printJobHeader() {
+    printf("\n%-4s %-22s %-15s %-20s %-10s %-18s %s\n",
+           "ID", "Customer", "Vehicle", "Service", "Priority", "Status", "Done");
+    printf("----------------------------------------------------------------------------------------------\n");
+}
+
+void printJobRow(int idx) {
+    Job *j = &jobs[idx];
+    char full[2 * NAME_LEN + 2];
+    sprintf(full, "%s %s", j->firstName, j->lastName);
+    printf("%-4d %-22s %-15s %-20s %-10s %-18s %d%%\n",
+           j->id, full, j->vehicleNo, serviceNames[j->service],
+           priorityName(j->priority), statusName(j->status), j->progress);
+}
+
+void printInventory() {
+    int p;
+    printf("\n%-14s %s\n", "Part", "In stock");
+    printf("-----------------------\n");
+    for (p = 0; p < NUM_PARTS; p++)
+        printf("%-14s %d\n", partNames[p], inventory[p]);
+}
+
+/* ================== HEAP (PRIORITY QUEUE) ================== */
+/* returns 1 if job a must be served before job b */
+int higher(int a, int b) {
+    if (jobs[a].priority != jobs[b].priority)
+        return jobs[a].priority < jobs[b].priority;
+    return jobs[a].id < jobs[b].id;
+}
+
+void swapHeap(int i, int j) {
+    int t = heap[i];
+    heap[i] = heap[j];
+    heap[j] = t;
+}
+
+void heapifyUp(int i) {
+    while (i > 0) {
+        int parent = (i - 1) / 2;
+        if (higher(heap[i], heap[parent])) {
+            swapHeap(i, parent);
+            i = parent;
+        } else {
+            break;
+        }
+    }
+}
+
+void heapifyDown(int i) {
+    while (1) {
+        int left = 2 * i + 1;
+        int right = 2 * i + 2;
+        int best = i;
+        if (left < heapSize && higher(heap[left], heap[best]))
+            best = left;
+        if (right < heapSize && higher(heap[right], heap[best]))
+            best = right;
+        if (best == i)
+            break;
+        swapHeap(i, best);
+        i = best;
+    }
+}
+
+void heapInsert(int jobIdx) {
+    heap[heapSize] = jobIdx;
+    heapifyUp(heapSize);
+    heapSize++;
+}
+
+void heapRemoveAt(int pos) {
+    heap[pos] = heap[heapSize - 1];
+    heapSize--;
+    if (pos < heapSize) {
+        heapifyUp(pos);
+        heapifyDown(pos);
+    }
+}
+
+int heapExtract() {
+    int idx = heap[0];
+    heapRemoveAt(0);
+    return idx;
+}
+
+int findInHeap(int jobIdx) {
+    int i;
+    for (i = 0; i < heapSize; i++)
+        if (heap[i] == jobIdx)
+            return i;
+    return -1;
+}
+
+/* ================== PART REQUEST HELPERS ================== */
+int hasPendingReq(int jobId, int part) {
+    int i;
+    for (i = 0; i < partReqCount; i++)
+        if (partReq[i].jobId == jobId && partReq[i].part == part &&
+            partReq[i].status == REQ_PENDING)
+            return 1;
+    return 0;
+}
+
+int pendingReqForJob(int jobId) {
+    int i, count = 0;
+    for (i = 0; i < partReqCount; i++)
+        if (partReq[i].jobId == jobId && partReq[i].status == REQ_PENDING)
+            count++;
+    return count;
+}
+
+void addPartReq(int jobId, int part, int qty) {
+    if (partReqCount == MAX_PART_REQ) {
+        printf("Part request list is full.\n");
+        return;
+    }
+    partReq[partReqCount].jobId = jobId;
+    partReq[partReqCount].part = part;
+    partReq[partReqCount].qty = qty;
+    partReq[partReqCount].status = REQ_PENDING;
+    partReqCount++;
+}
+
+/* ================== CUSTOMER PANEL ================== */
+void bookService() {
+    int s;
+    if (jobCount == MAX_JOBS) {
+        printf("Garage is full. Cannot take more requests.\n");
+        return;
+    }
+
+    Job *j = &jobs[jobCount];
+    j->id = jobCount + 1;
+
+    printf("First name: ");
+    scanf("%19s", j->firstName);
+    printf("Last name: ");
+    scanf("%19s", j->lastName);
+    printf("Vehicle number: ");
+    scanf("%14s", j->vehicleNo);
+
+    printf("\nServices available:\n");
+    for (s = 1; s <= NUM_SERVICES; s++)
+        printf("  %d. %s\n", s, serviceNames[s]);
+    j->service = readInt("Choose service: ", 1, NUM_SERVICES);
+
+    j->priority = readInt("Priority (1=Emergency, 2=Major, 3=Regular): ", 1, 3);
+    j->status = STATUS_WAITING;
+    j->progress = 0;
+    j->partsIssued = 0;
+
+    heapInsert(jobCount);
+    jobCount++;
+
+    printf("Request booked. Your Request ID is %d (keep it for tracking).\n", j->id);
+}
+
+/* asks for ID + vehicle number; returns job index or -1 */
+int verifyCustomer() {
+    char vehicle[VEHICLE_LEN];
+    int id = readInt("Enter request ID: ", 1, MAX_JOBS);
+    int idx = findJob(id);
+
+    printf("Vehicle number: ");
+    scanf("%14s", vehicle);
+
+    if (idx == -1 || strcmp(jobs[idx].vehicleNo, vehicle) != 0) {
+        printf("No request found with that ID and vehicle number.\n");
+        return -1;
+    }
+    return idx;
+}
+
+void trackRequest() {
+    int idx = verifyCustomer();
+    if (idx == -1) return;
+
+    printJobHeader();
+    printJobRow(idx);
+
+    if (jobs[idx].status == STATUS_WAITING) {
+        int i, ahead = 0;
+        for (i = 0; i < heapSize; i++)
+            if (higher(heap[i], idx))
+                ahead++;
+        printf("Vehicles ahead of you: %d\n", ahead);
+    }
+    if (jobs[idx].status == STATUS_WAITING_PARTS)
+        printf("Your service is paused until a part arrives.\n");
+}
+
+void cancelMyRequest() {
+    int idx = verifyCustomer();
+    if (idx == -1) return;
+
+    if (jobs[idx].status != STATUS_WAITING) {
+        printf("Only a waiting request can be cancelled (current status: %s).\n",
+               statusName(jobs[idx].status));
+        return;
+    }
+    heapRemoveAt(findInHeap(idx));
+    jobs[idx].status = STATUS_CANCELLED;
+    printf("Request %d cancelled.\n", jobs[idx].id);
+}
+
+void customerPanel() {
+    int choice;
+    do {
+        printf("\n--- CUSTOMER PANEL ---\n");
+        printf("1. Book a service\n");
+        printf("2. Track my request\n");
+        printf("3. Cancel my request\n");
+        printf("0. Back\n");
+        choice = readInt("Enter choice: ", 0, 3);
+
+        switch (choice) {
+            case 1: bookService(); break;
+            case 2: trackRequest(); break;
+            case 3: cancelMyRequest(); break;
+        }
+    } while (choice != 0);
+}
+
+/* ================== MECHANIC PANEL ================== */
+void viewNextJob() {
+    if (heapSize == 0) {
+        printf("No vehicles waiting.\n");
+        return;
+    }
+    printJobHeader();
+    printJobRow(heap[0]);
+}
+
+void startNextJob() {
+    if (heapSize == 0) {
+        printf("No vehicles waiting.\n");
+        return;
+    }
+    int idx = heapExtract();
+    jobs[idx].status = STATUS_IN_PROGRESS;
+    printf("\nStarted job:\n");
+    printJobHeader();
+    printJobRow(idx);
+}
+
+void viewActiveJobs() {
+    int i, found = 0;
+    for (i = 0; i < jobCount; i++) {
+        if (jobs[i].status == STATUS_IN_PROGRESS ||
+            jobs[i].status == STATUS_WAITING_PARTS) {
+            if (!found) printJobHeader();
+            printJobRow(i);
+            found = 1;
+        }
+    }
+    if (!found) printf("No active jobs.\n");
+}
+
+void updateProgress() {
+    int id = readInt("Enter job ID: ", 1, MAX_JOBS);
+    int idx = findJob(id);
+
+    if (idx == -1) {
+        printf("Job not found.\n");
+        return;
+    }
+    Job *j = &jobs[idx];
+
+    if (j->status == STATUS_WAITING_PARTS) {
+        printf("Job is waiting for parts. Wait for the owner to restock.\n");
+        return;
+    }
+    if (j->status != STATUS_IN_PROGRESS) {
+        printf("Job is not in progress (status: %s).\n", statusName(j->status));
+        return;
+    }
+
+    printf("Current progress: %d%%\n", j->progress);
+    int p = readInt("New progress (0-100): ", j->progress, 100);
+
+    if (p == 100 && !j->partsIssued) {
+        printf("Cannot complete: check and issue parts from inventory first.\n");
+        return;
+    }
+
+    j->progress = p;
+    if (p == 100) {
+        j->status = STATUS_COMPLETED;
+        printf("Job %d completed.\n", j->id);
+    } else {
+        printf("Progress updated to %d%%.\n", p);
+    }
+}
+
+void checkParts() {
+    int id = readInt("Enter job ID: ", 1, MAX_JOBS);
+    int idx = findJob(id);
+
+    if (idx == -1) {
+        printf("Job not found.\n");
+        return;
+    }
+    Job *j = &jobs[idx];
+
+    if (j->status != STATUS_IN_PROGRESS && j->status != STATUS_WAITING_PARTS) {
+        printf("Job is not active (status: %s).\n", statusName(j->status));
+        return;
+    }
+    if (j->partsIssued) {
+        printf("Parts were already issued for this job.\n");
+        return;
+    }
+
+    int p, shortCount = 0;
+    printf("\nParts needed for %s:\n", serviceNames[j->service]);
+    printf("%-14s %-8s %-8s %s\n", "Part", "Needed", "In stock", "Result");
+    for (p = 0; p < NUM_PARTS; p++) {
+        int need = serviceParts[j->service][p];
+        if (need == 0) continue;
+        printf("%-14s %-8d %-8d %s\n", partNames[p], need, inventory[p],
+               inventory[p] >= need ? "OK" : "SHORT");
+        if (inventory[p] < need) shortCount++;
+    }
+
+    if (shortCount == 0) {
+        for (p = 0; p < NUM_PARTS; p++)
+            inventory[p] -= serviceParts[j->service][p];
+        j->partsIssued = 1;
+        j->status = STATUS_IN_PROGRESS;
+        printf("All parts available. Issued from inventory.\n");
+        return;
+    }
+
+    printf("%d part(s) are short.\n", shortCount);
+    if (readInt("Send request to owner? (1=Yes, 0=No): ", 0, 1) == 1) {
+        for (p = 0; p < NUM_PARTS; p++) {
+            int need = serviceParts[j->service][p];
+            if (need > inventory[p] && !hasPendingReq(j->id, p))
+                addPartReq(j->id, p, need - inventory[p]);
+        }
+        j->status = STATUS_WAITING_PARTS;
+        printf("Request sent to owner. Job is now waiting for parts.\n");
+    }
+}
+
+void mechanicPanel() {
+    int choice;
+    do {
+        printf("\n--- MECHANIC PANEL ---\n");
+        printf("1. View next vehicle in queue\n");
+        printf("2. Start next job\n");
+        printf("3. View active jobs\n");
+        printf("4. Update work progress\n");
+        printf("5. Check parts / inventory for a job\n");
+        printf("6. View inventory\n");
+        printf("0. Back\n");
+        choice = readInt("Enter choice: ", 0, 6);
+
+        switch (choice) {
+            case 1: viewNextJob(); break;
+            case 2: startNextJob(); break;
+            case 3: viewActiveJobs(); break;
+            case 4: updateProgress(); break;
+            case 5: checkParts(); break;
+            case 6: printInventory(); break;
+        }
+    } while (choice != 0);
+}
+
+/* ================== OWNER PANEL ================== */
+void viewQueue() {
+    int temp[MAX_JOBS];
+    int i, j, n = heapSize;
+
+    if (n == 0) {
+        printf("No vehicles waiting.\n");
+        return;
+    }
+
+    /* sort a copy so the heap itself is not disturbed */
+    for (i = 0; i < n; i++)
+        temp[i] = heap[i];
+    for (i = 1; i < n; i++) {
+        int key = temp[i];
+        j = i - 1;
+        while (j >= 0 && higher(key, temp[j])) {
+            temp[j + 1] = temp[j];
+            j--;
+        }
+        temp[j + 1] = key;
+    }
+
+    printJobHeader();
+    for (i = 0; i < n; i++)
+        printJobRow(temp[i]);
+}
+
+void viewAllJobs() {
+    int i;
+    if (jobCount == 0) {
+        printf("No jobs yet.\n");
+        return;
+    }
+    printJobHeader();
+    for (i = 0; i < jobCount; i++)
+        printJobRow(i);
+}
+
+void viewPartRequests() {
+    int i;
+    if (partReqCount == 0) {
+        printf("No part requests.\n");
+        return;
+    }
+    printf("\n%-6s %-6s %-14s %-5s %s\n", "Req#", "Job", "Part", "Qty", "Status");
+    printf("-------------------------------------------------\n");
+    for (i = 0; i < partReqCount; i++)
+        printf("%-6d %-6d %-14s %-5d %s\n", i + 1, partReq[i].jobId,
+               partNames[partReq[i].part], partReq[i].qty,
+               partReq[i].status == REQ_PENDING ? "Pending" : "Fulfilled");
+}
+
+void fulfilRequest() {
+    if (partReqCount == 0) {
+        printf("No part requests.\n");
+        return;
+    }
+    int n = readInt("Enter request number: ", 1, partReqCount);
+    PartRequest *r = &partReq[n - 1];
+
+    if (r->status == REQ_FULFILLED) {
+        printf("That request is already fulfilled.\n");
+        return;
+    }
+
+    inventory[r->part] += r->qty;
+    r->status = REQ_FULFILLED;
+    printf("Added %d x %s to inventory.\n", r->qty, partNames[r->part]);
+
+    int idx = findJob(r->jobId);
+    if (idx != -1 && jobs[idx].status == STATUS_WAITING_PARTS &&
+        pendingReqForJob(r->jobId) == 0) {
+        jobs[idx].status = STATUS_IN_PROGRESS;
+        printf("Job %d can continue. Mechanic should re-check parts.\n", r->jobId);
+    }
+}
+
+void restockPart() {
+    int p, qty, i;
+    for (i = 0; i < NUM_PARTS; i++)
+        printf("  %d. %s (stock: %d)\n", i + 1, partNames[i], inventory[i]);
+    p = readInt("Choose part: ", 1, NUM_PARTS);
+    qty = readInt("Quantity to add: ", 1, 100);
+    inventory[p - 1] += qty;
+    printf("%s stock is now %d.\n", partNames[p - 1], inventory[p - 1]);
+}
+
+void changePriority() {
+    int id = readInt("Enter job ID: ", 1, MAX_JOBS);
+    int idx = findJob(id);
+
+    if (idx == -1) {
+        printf("Job not found.\n");
+        return;
+    }
+    if (jobs[idx].status != STATUS_WAITING) {
+        printf("Priority can only be changed for a waiting job.\n");
+        return;
+    }
+
+    jobs[idx].priority = readInt("New priority (1=Emergency, 2=Major, 3=Regular): ", 1, 3);
+    int pos = findInHeap(idx);
+    heapifyUp(pos);
+    heapifyDown(pos);
+    printf("Priority updated.\n");
+}
+
+void ownerPanel() {
+    int choice;
+    do {
+        printf("\n--- OWNER PANEL ---\n");
+        printf("1. View waiting queue\n");
+        printf("2. View all jobs\n");
+        printf("3. View inventory\n");
+        printf("4. View part requests from mechanic\n");
+        printf("5. Fulfil a part request\n");
+        printf("6. Restock a part\n");
+        printf("7. Change priority of a waiting job\n");
+        printf("0. Back\n");
+        choice = readInt("Enter choice: ", 0, 7);
+
+        switch (choice) {
+            case 1: viewQueue(); break;
+            case 2: viewAllJobs(); break;
+            case 3: printInventory(); break;
+            case 4: viewPartRequests(); break;
+            case 5: fulfilRequest(); break;
+            case 6: restockPart(); break;
+            case 7: changePriority(); break;
+        }
+    } while (choice != 0);
+}
+
+/* ================== LOGIN + MAIN ================== */
+int login(const char *password, const char *role) {
+    char input[30];
+    int t;
+    for (t = 0; t < MAX_LOGIN_TRIES; t++) {
+        printf("%s password: ", role);
+        scanf("%29s", input);
+        if (strcmp(input, password) == 0)
+            return 1;
+        printf("Wrong password.\n");
+    }
+    return 0;
+}
+
+int main() {
+    int choice;
+
+    do {
+        printf("\n===== Vehicle Service Scheduler =====\n");
+        printf("1. Customer panel\n");
+        printf("2. Mechanic panel\n");
+        printf("3. Owner panel\n");
+        printf("0. Exit\n");
+        choice = readInt("Enter choice: ", 0, 3);
+
+        if (choice == 1) {
+            customerPanel();
+        } else if (choice == 2) {
+            if (login(MECHANIC_PASSWORD, "Mechanic")) mechanicPanel();
+            else printf("Access denied.\n");
+        } else if (choice == 3) {
+            if (login(OWNER_PASSWORD, "Owner")) ownerPanel();
+            else printf("Access denied.\n");
+        }
+    } while (choice != 0);
+
+    printf("Goodbye!\n");
+    return 0;
+}
